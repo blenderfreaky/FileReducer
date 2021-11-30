@@ -1,7 +1,15 @@
 ﻿using FileReducer;
 
-FileHashDb db = new();
-await db.HashFolder("C:/Users/blend/Downloads");
-//await db.HashFolder(@"C:\Users\blend\Downloads\asus");
+var folder = @"C:\Users\blend\Downloads";
+//var folder = @"E:\Stuff";
 
-db.ListDuplicates();
+using (Profiler.MeasureStatic("Total"))
+{
+    FileHashDb db = new();
+
+    await db.HashFileSystemInfo(new DirectoryInfo(folder));
+
+    db.ListDuplicates();
+}
+
+Profiler.Global.PrintTimings();

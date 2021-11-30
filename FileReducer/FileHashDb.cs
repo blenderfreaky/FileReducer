@@ -1,142 +1,136 @@
-﻿using System;
+﻿namespace FileReducer;
 
-namespace FileReducer
+using LiteDB;
+using System;
+using System.Buffers;
+using System.Collections.Generic;
+using System.Text;
+
+public class FileHashDb : IDisposable
 {
-    using Blake2Fast;
-    using LiteDB;
-    using System;
-    using System.Buffers;
-    using System.Collections.Generic;
-    using System.Text;
+    private bool disposedValue;
 
-    public class FileHashDb : IDisposable
+    public LiteDatabase Database { get; }
+    public ILiteCollection<DataHash> Hashes { get; }
+
+    public ArrayPool<byte> Pool { get; } = ArrayPool<byte>.Shared;
+    public SemaphoreSlim SemaphoreSlim { get; } = new(32, 32);
+
+    public FileHashDb()
     {
-        private bool disposedValue;
+        Database = new("Cache.db");
+        Hashes = Database.GetCollection<DataHash>("hashes");
+        Hashes.EnsureIndex("Target", x => new { x.Path, x.SegmentLength }, true);
+        BsonMapper.Global.RegisterType
+        (
+            serialize: obj => new BsonValue(obj.Data),
+            deserialize: doc => new Hash(doc.AsBinary)
+        );
+    }
 
-        public LiteDatabase Database { get; }
-        public ILiteCollection<FileHash> Hashes { get; }
+    private async Task<Action> Synchronization(FileSystemInfo info, CancellationToken cancellationToken = default)
+    {
+        await SemaphoreSlim.WaitAsync(cancellationToken);
+        return () => SemaphoreSlim.Release();
+    }
 
-        public ArrayPool<byte> Pool { get; } = ArrayPool<byte>.Shared;
+    private DataHash? Cache(FileSystemInfo info, int segmentLength)
+    {
+        using var _ = Profiler.MeasureStatic("Caching");
+        var isDirectory = info is DirectoryInfo;
+        var result = Hashes.Query()
+            .Where(x => x.Path == info.FullName && x.SegmentLength == segmentLength && x.IsDirectory == isDirectory && x.LastWriteUtc >= info.LastWriteTimeUtc)
+            .FirstOrDefault();
+        return result == default ? null : result;
+    }
 
-        public FileHashDb()
+    private record struct HashPass(FileHashDb FileHashDb, int SegmentLength, Func<FileSystemInfo, bool> ShouldHash, Action<DataHash, TimeSpan?> OnHashed) : IHasher
+    {
+        public ArrayPool<byte> ArrayPool { get; } = ArrayPool<byte>.Shared;
+
+        public DataHash? Cache(FileSystemInfo info) => FileHashDb.Cache(info, SegmentLength);
+
+        void IHasher.OnHashed(DataHash dataHash, TimeSpan? duration) => OnHashed(dataHash, duration);
+
+        public Task<Action> Synchronization(FileSystemInfo info, CancellationToken cancellationToken = default) => FileHashDb.Synchronization(info, cancellationToken);
+
+        bool IHasher.ShouldHash(FileSystemInfo info) => ShouldHash(info);
+    }
+
+    public async Task<DataHash> HashFileSystemInfo(FileSystemInfo info, int segmentLength = 8192, CancellationToken cancellationToken = default)
+    {
+        Ignore.Ignore ignore = new();
+        var path = Path.Combine(info is DirectoryInfo directory ? directory.FullName : Path.GetDirectoryName(info.FullName)!, ".dupeignore");
+        if (Directory.Exists(path)) ignore.Add(File.ReadAllLines(path));
+        var hash = await DataHash.FromFileSystemInfoAsync(info, new HashPass(this, segmentLength, info => !ignore.IsIgnored(info.FullName), (hash, time) =>
         {
-            Database = new("Cache.db");
-            Hashes = Database.GetCollection<FileHash>("hashes");
-            Hashes.EnsureIndex(x => x.Path);
-            BsonMapper.Global.RegisterType<Hash>
-            (
-                serialize: obj => new BsonValue(obj.Data),
-                deserialize: doc => new Hash(doc.AsBinary)
-            );
-        }
+            Hashes.Upsert(hash);
+            Console.WriteLine($"Finished hashing ({time ?? TimeSpan.Zero}) {hash.Path}");
+        }), cancellationToken);
+        return hash;
+    }
 
-        public async Task HashFolder(string path, int segmentLength = 8192, CancellationToken cancellationToken = default)
+    public async void ListDuplicates()
+    {
+        var allDupes = Hashes.Query()
+            .GroupBy("$.Hash").Select("ARRAY(*)").ToEnumerable()
+            .Select<BsonDocument, ICollection<BsonValue>>(x => x.Values.First().AsArray)
+            .Where(x => x.Count > 1)
+            .Select(x => x.Select(x => x["Path"].AsString));
+        foreach (var dupes in allDupes)
         {
-            path = Path.GetFullPath(path);
-            Console.WriteLine("Entering folder " + path);
-            await Task.WhenAll(
-                Task.WhenAll(Directory.GetFiles(path).Select(x => HashFile(x, segmentLength, cancellationToken))),
-                Task.WhenAll(Directory.GetDirectories(path).Select(x => HashFolder(x, segmentLength, cancellationToken))));
-        }
+            var fullInfo = dupes.Select(x => Hashes.Query().Where(y => y.Path == x).ToList()).ToList();
 
-        public async Task<FileHash> HashFile(string path, int segmentLength = 8192, CancellationToken cancellationToken = default)
-        {
-            path = Path.GetFullPath(path);
-            var cached = Hashes.Query().Where(x => x.Path == path).FirstOrDefault();
-            if (cached != default)
-            {
-                Console.WriteLine("File cached " + path);
-                return cached;
-            }
-            Console.WriteLine("Hashing file " + path);
-            var buffer = Pool.Rent(segmentLength * 2);
-            var stream = File.OpenRead(path);
-            var length = stream.Length;
+            var bs = 8 * 1024 * 1024;
+            var hashTasks = dupes.Select(x => (Path: x, HashTask: Hash.Blake2b(File.OpenRead(x), Pool.Rent(bs).AsMemory(0, bs)))).ToList();
+            await Task.WhenAll(hashTasks.Select(x => x.HashTask));
+            var hashes = hashTasks.Select(x => (x.Path, Hash: x.HashTask.Result)).ToList();
 
-            if (length <= segmentLength * 2)
-            {
-                await stream.ReadAsync(buffer.AsMemory(0, (int)length), cancellationToken);
-            }
-            else
-            {
-                await stream.ReadAsync(buffer.AsMemory(0, segmentLength), cancellationToken);
-                if (cancellationToken.IsCancellationRequested) return default;
-                stream.Seek(segmentLength, SeekOrigin.End);
-                await stream.ReadAsync(buffer.AsMemory(segmentLength, segmentLength), cancellationToken);
-            }
-            if (cancellationToken.IsCancellationRequested) return default;
-
-            var hash = Hash.Blake2b(buffer.AsSpan(0, (int)Math.Min(length, segmentLength * 2)));
-
-            FileHash fileHash = new(path, segmentLength, hash);
-            Hashes.Insert(fileHash);
-            return fileHash;
-        }
-
-        public void ListDuplicates()
-        {
-            var dupes = Hashes.Query()
-                .GroupBy("$.Hash").Select("ARRAY(*)").ToEnumerable()
-                .Select<BsonDocument, ICollection<BsonValue>>(x => x.Values.First().AsArray)
+            var collisions = hashes
+                .GroupBy(x => x.Hash)
+                .Select(x => x.ToList())
                 .Where(x => x.Count > 1)
-                .Select(x => x.Select(x => x["Path"].AsString));
-            foreach (var dupe in dupes) Console.WriteLine(string.Join(", ", dupe));
-        }
+                .ToList();
 
-        #region IDisposable
-        protected virtual void Dispose(bool disposing)
-        {
-            if (!disposedValue)
+            var falsePositives = hashes.Count - collisions.Sum(x => x.Count);
+            if (falsePositives > 0) Console.WriteLine("False positives " + falsePositives);
+
+            foreach (var realDupes in collisions)
             {
-                if (disposing)
-                {
-                    Database.Dispose();
-                    // TODO: dispose managed state (managed objects)
-                }
-
-                // TODO: free unmanaged resources (unmanaged objects) and override finalizer
-                // TODO: set large fields to null
-                disposedValue = true;
+                Console.WriteLine(string.Join(", ", realDupes.Select(x => x.Path)));
             }
         }
-
-        // // TODO: override finalizer only if 'Dispose(bool disposing)' has code to free unmanaged resources
-        // ~FileHashDb()
-        // {
-        //     // Do not change this code. Put cleanup code in 'Dispose(bool disposing)' method
-        //     Dispose(disposing: false);
-        // }
-
-        public void Dispose()
-        {
-            // Do not change this code. Put cleanup code in 'Dispose(bool disposing)' method
-            Dispose(disposing: true);
-            GC.SuppressFinalize(this);
-        }
-        #endregion IDisposable
     }
-    public record struct FileHash(string Path, int SegmentLength, Hash Hash);
-    public readonly struct Hash : IEquatable<Hash>
+
+    #region IDisposable
+    protected virtual void Dispose(bool disposing)
     {
-        public readonly byte[] Data;
-        public readonly int HashCode;
-
-        public Hash(byte[] hash)
+        if (!disposedValue)
         {
-            Data = hash;
+            if (disposing)
+            {
+                Database.Dispose();
+                // TODO: dispose managed state (managed objects)
+            }
 
-            HashCode hashCode = new();
-            hashCode.AddBytes(hash);
-            HashCode = hashCode.ToHashCode();
+            // TODO: free unmanaged resources (unmanaged objects) and override finalizer
+            // TODO: set large fields to null
+            disposedValue = true;
         }
-
-        public static Hash Blake2b(ReadOnlySpan<byte> toHash) => new(Blake2Fast.Blake2b.ComputeHash(toHash));
-
-        public readonly override bool Equals(object? obj) => obj is Hash hash && Equals(hash);
-        public readonly bool Equals(Hash other) => HashCode == other.HashCode && (Data == other.Data || Data?.SequenceEqual(other.Data) == true);
-        public readonly override int GetHashCode() => HashCode;
-        public readonly override string? ToString() => Data == null ? "null" : string.Concat(Data.Select(x => x.ToString("X")));
-        public static bool operator ==(Hash left, Hash right) => left.Equals(right);
-        public static bool operator !=(Hash left, Hash right) => !(left == right);
     }
+
+    // // TODO: override finalizer only if 'Dispose(bool disposing)' has code to free unmanaged resources
+    // ~FileHashDb()
+    // {
+    //     // Do not change this code. Put cleanup code in 'Dispose(bool disposing)' method
+    //     Dispose(disposing: false);
+    // }
+
+    public void Dispose()
+    {
+        // Do not change this code. Put cleanup code in 'Dispose(bool disposing)' method
+        Dispose(disposing: true);
+        GC.SuppressFinalize(this);
+    }
+    #endregion IDisposable
 }
