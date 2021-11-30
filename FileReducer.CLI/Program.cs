@@ -1,7 +1,7 @@
 ﻿using FileReducer;
 
-var folder = @"C:\Users\blend\Downloads";
-//var folder = @"E:\Stuff";
+//var folder = @"C:\Users\blend\Downloads";
+var folder = @"E:\Stuff";
 
 using (Profiler.MeasureStatic("Total"))
 {

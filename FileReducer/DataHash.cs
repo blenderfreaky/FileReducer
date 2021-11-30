@@ -35,22 +35,19 @@ public record struct DataHash(string Path, bool IsDirectory, int SegmentLength, 
             if (sync != null) await sync;
 
             var allHashesTask =
-                    info.EnumerateDirectories().Where(hasher.ShouldHash)
-                    .Select(x => FromFolderAsync(x, hasher, cancellationToken))
-                .Concat(
-                    info.EnumerateFiles().Where(hasher.ShouldHash)
-                    .Select(x => FromFileAsync(x, hasher, cancellationToken)))
+                    info.EnumerateFileSystemInfos().Where(hasher.ShouldHash)
+                    .Select(x => FromFileSystemInfoAsync(x, hasher, cancellationToken))
                 .ToList();
 
             await Task.WhenAll(allHashesTask);
 
             using var timer = Profiler.MeasureStatic("Hashing.Directory");
 
-            var allHashes = allHashesTask.Select(x => x.Result).Where(x => x != default).ToList();
+            var allHashes = allHashesTask.Where(x => x.IsCompletedSuccessfully).Select(x => x.Result).Where(x => x != default).ToList();
             var length = allHashes.Sum(x => x.DataLength);
             var hash = Hash.Blake2b(allHashes.Select(x => x.Hash));
 
-            DataHash fileHash = new(info.FullName, false, hasher.SegmentLength, length, hash, info.LastWriteTimeUtc, DateTime.UtcNow);
+            DataHash fileHash = new(info.FullName, true, hasher.SegmentLength, length, hash, info.LastWriteTimeUtc, DateTime.UtcNow);
             hasher.OnHashed(fileHash, timer.Stop());
             return fileHash;
         }
@@ -101,7 +98,7 @@ public record struct DataHash(string Path, bool IsDirectory, int SegmentLength, 
             hasher.OnHashed(fileHash, timer.Stop());
             return fileHash;
         }
-        catch (IOException ex)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             Console.WriteLine(ex.ToString());
             return default;

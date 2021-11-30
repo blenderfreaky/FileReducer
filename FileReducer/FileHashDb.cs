@@ -20,7 +20,7 @@ public class FileHashDb : IDisposable
     {
         Database = new("Cache.db");
         Hashes = Database.GetCollection<DataHash>("hashes");
-        Hashes.EnsureIndex("Target", x => new { x.Path, x.SegmentLength }, true);
+        //Hashes.EnsureIndex("Target", x => new { x.Path, x.SegmentLength }, true);
         BsonMapper.Global.RegisterType
         (
             serialize: obj => new BsonValue(obj.Data),
@@ -36,12 +36,26 @@ public class FileHashDb : IDisposable
 
     private DataHash? Cache(FileSystemInfo info, int segmentLength)
     {
-        using var _ = Profiler.MeasureStatic("Caching");
-        var isDirectory = info is DirectoryInfo;
-        var result = Hashes.Query()
-            .Where(x => x.Path == info.FullName && x.SegmentLength == segmentLength && x.IsDirectory == isDirectory && x.LastWriteUtc >= info.LastWriteTimeUtc)
-            .FirstOrDefault();
-        return result == default ? null : result;
+        try
+        {
+            using var _ = Profiler.MeasureStatic("Caching");
+            var fileInfo = info as FileInfo;
+            var isDirectory = fileInfo == null;
+            var result = Hashes.Query()
+                .Where(x => x.Path == info.FullName && x.SegmentLength == segmentLength && x.LastWriteUtc >= info.LastWriteTimeUtc)
+                .OrderBy(x => x.LastWriteUtc)
+                .FirstOrDefault();
+            if (result == default) return null;
+            if (result.IsDirectory != isDirectory) return null; // Putting this into LiteDB query crashes everytime
+            if (!isDirectory && fileInfo!.Length != result.DataLength) return null;
+            return result;
+        }
+        catch (LiteException ex)
+        {
+            Console.WriteLine(info);
+            Console.WriteLine(ex.ToString());
+            return null;
+        }
     }
 
     private record struct HashPass(FileHashDb FileHashDb, int SegmentLength, Func<FileSystemInfo, bool> ShouldHash, Action<DataHash, TimeSpan?> OnHashed) : IHasher
@@ -61,10 +75,11 @@ public class FileHashDb : IDisposable
     {
         Ignore.Ignore ignore = new();
         var path = Path.Combine(info is DirectoryInfo directory ? directory.FullName : Path.GetDirectoryName(info.FullName)!, ".dupeignore");
-        if (Directory.Exists(path)) ignore.Add(File.ReadAllLines(path));
+        if (File.Exists(path)) ignore.Add(File.ReadAllLines(path));
         var hash = await DataHash.FromFileSystemInfoAsync(info, new HashPass(this, segmentLength, info => !ignore.IsIgnored(info.FullName), (hash, time) =>
         {
-            Hashes.Upsert(hash);
+            //if (!Hashes.Update(hash)) Hashes.Insert(hash); // Upsert no worky
+            Hashes.Insert(hash);
             Console.WriteLine($"Finished hashing ({time ?? TimeSpan.Zero}) {hash.Path}");
         }), cancellationToken);
         return hash;
@@ -82,7 +97,18 @@ public class FileHashDb : IDisposable
             var fullInfo = dupes.Select(x => Hashes.Query().Where(y => y.Path == x).ToList()).ToList();
 
             var bs = 8 * 1024 * 1024;
-            var hashTasks = dupes.Select(x => (Path: x, HashTask: Hash.Blake2b(File.OpenRead(x), Pool.Rent(bs).AsMemory(0, bs)))).ToList();
+            var hashTasks = dupes.Select(x =>
+            {
+                try
+                {
+                    return (Path: x, HashTask: Hash.Blake2b(File.OpenRead(x), Pool.Rent(bs).AsMemory(0, bs)));
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    Console.WriteLine(ex.ToString());
+                    return default;
+                }
+            }).Where(x => x != default).ToList();
             await Task.WhenAll(hashTasks.Select(x => x.HashTask));
             var hashes = hashTasks.Select(x => (x.Path, Hash: x.HashTask.Result)).ToList();
 
