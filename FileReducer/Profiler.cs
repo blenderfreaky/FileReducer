@@ -8,6 +8,8 @@ public class Profiler
     public static readonly Profiler Global = new();
 
     public static Timer MeasureStatic(string name) => Global.Measure(name);
+    public static void MeasureStatic(string name, Action action) => Global.Measure(name, action);
+    public static T MeasureStatic<T>(string name, Func<T> action) => Global.Measure(name, action);
 
     private ConcurrentDictionary<string, Timing> Timings { get; } = new();
 
@@ -38,9 +40,17 @@ public class Profiler
         Timings.AddOrUpdate(timer.Name, _ => new(timer.Stopwatch.Elapsed, 1), (_, prev) => new(prev.TotalTime + timer.Stopwatch.Elapsed, prev.CallCount + 1));
     }
 
-    public Timer Measure(string name)
+    public Timer Measure(string name) => new(Stopwatch.StartNew(), this, name);
+
+    public void Measure(string name, Action action)
     {
-        return new(Stopwatch.StartNew(), this, name);
+        using var _ = Measure(name);
+        action();
+    }
+    public T Measure<T>(string name, Func<T> func)
+    {
+        using var _ = Measure(name);
+        return func();
     }
 
     public Timing GetTiming(string name) => Timings[name];

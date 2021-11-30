@@ -13,6 +13,24 @@ public interface IHasher
 
     int SegmentLength { get; }
     ArrayPool<byte> ArrayPool { get; }
+    bool CacheFiles { get; }
+}
+
+public record struct TrivialHasher(int SegmentLength) : IHasher
+{
+    public ArrayPool<byte> ArrayPool { get; } = ArrayPool<byte>.Shared;
+    public bool CacheFiles { get; } = false;
+
+    public DataHash? Cache(FileSystemInfo info) => null;
+
+    public void OnHashed(DataHash dataHash, TimeSpan? duration)
+    {
+        Console.WriteLine($"Finished hashing ({duration ?? TimeSpan.Zero}) {dataHash.Path}");
+    }
+
+    public bool ShouldHash(FileSystemInfo info) => true;
+
+    public Task<Action> Synchronization(FileSystemInfo info, CancellationToken cancellationToken = default) => Task.FromResult(() => { });
 }
 
 public record struct DataHash(string Path, bool IsDirectory, int SegmentLength, long DataLength, Hash Hash, DateTime LastWriteUtc, DateTime HashTimeUtc)
@@ -25,12 +43,15 @@ public record struct DataHash(string Path, bool IsDirectory, int SegmentLength, 
         : info is FileInfo fileInfo ? FromFileAsync(fileInfo, hasher, cancellationToken)
         : throw new ArgumentException("Should be DirectoryInfo or FileInfo", nameof(info));
 
+    public static FileSystemInfo? FolderOrFile(string path) => Directory.Exists(path) ? new DirectoryInfo(path) : File.Exists(path) ? new FileInfo(path) : null;
+
     public static async Task<DataHash> FromFolderAsync(DirectoryInfo info, IHasher hasher, CancellationToken cancellationToken = default)
     {
         var sync = hasher.Synchronization(info, cancellationToken);
         byte[]? buffer = null;
         try
         {
+            if (cancellationToken.IsCancellationRequested) return default;
             if (hasher.Cache(info) is DataHash cached) return cached;
             if (sync != null) await sync;
 
@@ -76,23 +97,32 @@ public record struct DataHash(string Path, bool IsDirectory, int SegmentLength, 
             using var stream = info.OpenRead();
             var length = stream.Length;
 
-            buffer = hasher.ArrayPool.Rent(hasher.SegmentLength * 2);
+            Hash hash;
 
-            if (length <= hasher.SegmentLength * 2)
+            if (hasher.SegmentLength > 0)
             {
-                await stream.ReadAsync(buffer.AsMemory(0, (int)length), cancellationToken);
+                buffer = hasher.ArrayPool.Rent(hasher.SegmentLength * 2);
+
+                if (length <= hasher.SegmentLength * 2)
+                {
+                    await stream.ReadAsync(buffer.AsMemory(0, (int)length), cancellationToken);
+                }
+                else
+                {
+                    await stream.ReadAsync(buffer.AsMemory(0, hasher.SegmentLength), cancellationToken);
+                    if (cancellationToken.IsCancellationRequested) return default;
+
+                    stream.Seek(-hasher.SegmentLength, SeekOrigin.End);
+                    await stream.ReadAsync(buffer.AsMemory(hasher.SegmentLength, hasher.SegmentLength), cancellationToken);
+                }
+                if (cancellationToken.IsCancellationRequested) return default;
+                hash = Hash.Blake2b(buffer.AsSpan(0, (int)Math.Min(length, hasher.SegmentLength * 2)));
             }
             else
             {
-                await stream.ReadAsync(buffer.AsMemory(0, hasher.SegmentLength), cancellationToken);
-                if (cancellationToken.IsCancellationRequested) return default;
-
-                stream.Seek(hasher.SegmentLength, SeekOrigin.End);
-                await stream.ReadAsync(buffer.AsMemory(hasher.SegmentLength, hasher.SegmentLength), cancellationToken);
+                int bs = 8 * 1024 * 1024;
+                hash = await Hash.Blake2b(stream, hasher.ArrayPool.Rent(bs).AsMemory(0, bs), false, cancellationToken);
             }
-            if (cancellationToken.IsCancellationRequested) return default;
-
-            var hash = Hash.Blake2b(buffer.AsSpan(0, (int)Math.Min(length, hasher.SegmentLength * 2)));
 
             DataHash fileHash = new(info.FullName, false, hasher.SegmentLength, length, hash, info.LastWriteTimeUtc, DateTime.UtcNow);
             hasher.OnHashed(fileHash, timer.Stop());

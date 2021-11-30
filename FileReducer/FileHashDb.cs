@@ -14,11 +14,12 @@ public class FileHashDb : IDisposable
     public ILiteCollection<DataHash> Hashes { get; }
 
     public ArrayPool<byte> Pool { get; } = ArrayPool<byte>.Shared;
-    public SemaphoreSlim SemaphoreSlim { get; } = new(32, 32);
+    public SemaphoreSlim SemaphoreSlim { get; }
 
-    public FileHashDb()
+    public FileHashDb(int maxJobs = 32, string cacheFile = "Cache.db")
     {
-        Database = new("Cache.db");
+        Database = new(cacheFile);
+        SemaphoreSlim = new(maxJobs, maxJobs);
         Hashes = Database.GetCollection<DataHash>("hashes");
         //Hashes.EnsureIndex("Target", x => new { x.Path, x.SegmentLength }, true);
         BsonMapper.Global.RegisterType
@@ -58,7 +59,7 @@ public class FileHashDb : IDisposable
         }
     }
 
-    private record struct HashPass(FileHashDb FileHashDb, int SegmentLength, Func<FileSystemInfo, bool> ShouldHash, Action<DataHash, TimeSpan?> OnHashed) : IHasher
+    private record struct HashPass(FileHashDb FileHashDb, int SegmentLength, bool CacheFiles, Func<FileSystemInfo, bool> ShouldHash, Action<DataHash, TimeSpan?> OnHashed) : IHasher
     {
         public ArrayPool<byte> ArrayPool { get; } = ArrayPool<byte>.Shared;
 
@@ -76,56 +77,70 @@ public class FileHashDb : IDisposable
         Ignore.Ignore ignore = new();
         var path = Path.Combine(info is DirectoryInfo directory ? directory.FullName : Path.GetDirectoryName(info.FullName)!, ".dupeignore");
         if (File.Exists(path)) ignore.Add(File.ReadAllLines(path));
-        var hash = await DataHash.FromFileSystemInfoAsync(info, new HashPass(this, segmentLength, info => !ignore.IsIgnored(info.FullName), (hash, time) =>
+        var hash = await DataHash.FromFileSystemInfoAsync(info, new HashPass(this, segmentLength, segmentLength == 0, info => !ignore.IsIgnored(info.FullName), (hash, time) =>
         {
             //if (!Hashes.Update(hash)) Hashes.Insert(hash); // Upsert no worky
-            Hashes.Insert(hash);
+            Hashes.Upsert(hash);
             Console.WriteLine($"Finished hashing ({time ?? TimeSpan.Zero}) {hash.Path}");
         }), cancellationToken);
         return hash;
     }
 
-    public async void ListDuplicates()
+    public async Task ListDuplicates(CancellationToken cancellationToken = default)
     {
-        var allDupes = Hashes.Query()
-            .GroupBy("$.Hash").Select("ARRAY(*)").ToEnumerable()
-            .Select<BsonDocument, ICollection<BsonValue>>(x => x.Values.First().AsArray)
-            .Where(x => x.Count > 1)
-            .Select(x => x.Select(x => x["Path"].AsString));
-        foreach (var dupes in allDupes)
-        {
-            var fullInfo = dupes.Select(x => Hashes.Query().Where(y => y.Path == x).ToList()).ToList();
-
-            var bs = 8 * 1024 * 1024;
-            var hashTasks = dupes.Select(x =>
-            {
-                try
-                {
-                    return (Path: x, HashTask: Hash.Blake2b(File.OpenRead(x), Pool.Rent(bs).AsMemory(0, bs)));
-                }
-                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-                {
-                    Console.WriteLine(ex.ToString());
-                    return default;
-                }
-            }).Where(x => x != default).ToList();
-            await Task.WhenAll(hashTasks.Select(x => x.HashTask));
-            var hashes = hashTasks.Select(x => (x.Path, Hash: x.HashTask.Result)).ToList();
-
-            var collisions = hashes
-                .GroupBy(x => x.Hash)
-                .Select(x => x.ToList())
+        var allDupes = Profiler.MeasureStatic("Duplicates.Query",
+                () => Hashes.Query()
+                .GroupBy("$.Hash").Select("ARRAY(*)").ToEnumerable()
+                .Select<BsonDocument, ICollection<BsonValue>>(x => x.Values.First().AsArray)
                 .Where(x => x.Count > 1)
-                .ToList();
+                .Select(x => x.Select(x => BsonMapper.Global.ToObject<DataHash>(x.AsDocument)).ToList())
+                .ToList()
+            );
 
-            var falsePositives = hashes.Count - collisions.Sum(x => x.Count);
-            if (falsePositives > 0) Console.WriteLine("False positives " + falsePositives);
+        var previousDupeCount = allDupes.Sum(x => x.Count);
 
-            foreach (var realDupes in collisions)
+        using var _ = Profiler.MeasureStatic("Duplicates.Verification");
+        var steps = new int[] { 2, 4, 8, 16, 32, 0 };
+        foreach (var step in steps)
+        {
+            using var __ = Profiler.MeasureStatic("Duplicates.Verification." + step);
+            allDupes = (await VerifyDuplicates(allDupes, step * 8192, cancellationToken)).Select(x => x.ToList()).ToList();
+
+            var falsePositives = allDupes.Sum(x => x.Count) - previousDupeCount;
+            if (falsePositives > 0) Console.WriteLine("Removed " + falsePositives + " false positives");
+
+            foreach (var dupes in allDupes)
             {
-                Console.WriteLine(string.Join(", ", realDupes.Select(x => x.Path)));
+                Console.WriteLine($"Duplicates (Factor {step}): " + string.Join(", ", dupes.Select(x => x.Path)));
             }
         }
+    }
+
+    private async Task<IEnumerable<IEnumerable<DataHash>>> VerifyDuplicates(IEnumerable<IEnumerable<DataHash>> duplicateGroups, int segmentLength = 0, CancellationToken cancellationToken = default)
+    {
+        var result = duplicateGroups.Select(async duplicates =>
+        {
+            var hashTasks = duplicates.Select(async x =>
+            {
+                var info = DataHash.FolderOrFile(x.Path);
+                if (info == null) return default;
+                return await HashFileSystemInfo(info, 0, cancellationToken);
+            })
+                .Where(x => x != default).ToList();
+
+            await Task.WhenAll(hashTasks.Select(x => x));
+            var hashes = hashTasks.Select(x => x.Result).ToList();
+
+            var collisions = hashes
+                .GroupBy(x => (x.Hash, x.DataLength))
+                .Select(x => x.ToList())
+                .Where(x => x.Count > 1);
+
+            return collisions;
+        });
+
+        await Task.WhenAll(result);
+        return result.SelectMany(x => x.Result);
     }
 
     #region IDisposable
