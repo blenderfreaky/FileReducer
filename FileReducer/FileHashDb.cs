@@ -49,6 +49,8 @@ public class FileHashDb : IDisposable
             if (result == default) return null;
             if (result.IsDirectory != isDirectory) return null; // Putting this into LiteDB query crashes everytime
             if (!isDirectory && fileInfo!.Length != result.DataLength) return null;
+            //Console.WriteLine("Cache hit: " + result.Path);
+            if (result.DirectoryPath == null) result = result with { DirectoryPath = result.IsDirectory ? result.Path : fileInfo!.DirectoryName! };
             return result;
         }
         catch (LiteException ex)
@@ -103,11 +105,13 @@ public class FileHashDb : IDisposable
         var steps = new int[] { 2, 4, 8, 16, 32, 0 };
         foreach (var step in steps)
         {
+            Console.WriteLine("Starting dedupe step " + step);
             using var __ = Profiler.MeasureStatic("Duplicates.Verification." + step);
             allDupes = (await VerifyDuplicates(allDupes, step * 8192, cancellationToken)).Select(x => x.ToList()).ToList();
 
             var falsePositives = allDupes.Sum(x => x.Count) - previousDupeCount;
-            if (falsePositives > 0) Console.WriteLine("Removed " + falsePositives + " false positives");
+            if (falsePositives > 0) Console.WriteLine("Removed " + falsePositives + " false positives in step " + step);
+            else Console.WriteLine("No false positives in step " + step);
 
             foreach (var dupes in allDupes)
             {
@@ -124,7 +128,7 @@ public class FileHashDb : IDisposable
             {
                 var info = DataHash.FolderOrFile(x.Path);
                 if (info == null) return default;
-                return await HashFileSystemInfo(info, 0, cancellationToken);
+                return await HashFileSystemInfo(info, segmentLength, cancellationToken);
             })
                 .Where(x => x != default).ToList();
 

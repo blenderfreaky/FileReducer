@@ -33,7 +33,7 @@ public record struct TrivialHasher(int SegmentLength) : IHasher
     public Task<Action> Synchronization(FileSystemInfo info, CancellationToken cancellationToken = default) => Task.FromResult(() => { });
 }
 
-public record struct DataHash(string Path, bool IsDirectory, int SegmentLength, long DataLength, Hash Hash, DateTime LastWriteUtc, DateTime HashTimeUtc)
+public record struct DataHash(string Path, string DirectoryPath, bool IsDirectory, int SegmentLength, long DataLength, Hash Hash, DateTime LastWriteUtc, DateTime HashTimeUtc)
 {
     public delegate Task<Action> Synchronization(string path, int segmentLength, bool isDirectory, CancellationToken cancellationToken = default);
     public delegate DataHash? Cache(string path, int segmentLength, bool isDirectory);
@@ -52,7 +52,7 @@ public record struct DataHash(string Path, bool IsDirectory, int SegmentLength, 
         try
         {
             if (cancellationToken.IsCancellationRequested) return default;
-            if (hasher.Cache(info) is DataHash cached) return cached;
+            if (hasher.Cache(info) is DataHash cached) ;// return cached;
             if (sync != null) await sync;
 
             var allHashesTask =
@@ -68,7 +68,7 @@ public record struct DataHash(string Path, bool IsDirectory, int SegmentLength, 
             var length = allHashes.Sum(x => x.DataLength);
             var hash = Hash.Blake2b(allHashes.Select(x => x.Hash));
 
-            DataHash fileHash = new(info.FullName, true, hasher.SegmentLength, length, hash, info.LastWriteTimeUtc, DateTime.UtcNow);
+            DataHash fileHash = new(info.FullName, info.FullName, true, hasher.SegmentLength, length, hash, info.LastWriteTimeUtc, DateTime.UtcNow);
             hasher.OnHashed(fileHash, timer.Stop());
             return fileHash;
         }
@@ -90,10 +90,12 @@ public record struct DataHash(string Path, bool IsDirectory, int SegmentLength, 
         byte[]? buffer = null;
         try
         {
-            if (hasher.Cache(info) is DataHash cached) return cached;
             if (sync != null) await sync;
-
             using var timer = Profiler.MeasureStatic("Hashing.File");
+            if (
+                //hasher.CacheFiles && 
+                hasher.Cache(info) is DataHash cached) return cached;
+
             using var stream = info.OpenRead();
             var length = stream.Length;
 
@@ -124,7 +126,7 @@ public record struct DataHash(string Path, bool IsDirectory, int SegmentLength, 
                 hash = await Hash.Blake2b(stream, hasher.ArrayPool.Rent(bs).AsMemory(0, bs), false, cancellationToken);
             }
 
-            DataHash fileHash = new(info.FullName, false, hasher.SegmentLength, length, hash, info.LastWriteTimeUtc, DateTime.UtcNow);
+            DataHash fileHash = new(info.FullName, info.DirectoryName!, false, hasher.SegmentLength, length, hash, info.LastWriteTimeUtc, DateTime.UtcNow);
             hasher.OnHashed(fileHash, timer.Stop());
             return fileHash;
         }
