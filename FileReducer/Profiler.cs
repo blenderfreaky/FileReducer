@@ -10,6 +10,7 @@ public class Profiler
     public static Timer MeasureStatic(string name) => Global.Measure(name);
     public static void MeasureStatic(string name, Action action) => Global.Measure(name, action);
     public static T MeasureStatic<T>(string name, Func<T> action) => Global.Measure(name, action);
+    public static T MeasureStaticF<T>(string name, Func<T> action) => MeasureStatic(name, action);
 
     private ConcurrentDictionary<string, Timing> Timings { get; } = new();
 
@@ -52,11 +53,13 @@ public class Profiler
         using var _ = Measure(name);
         return func();
     }
+    public T MeasureF<T>(string name, Func<T> func) => Measure(name, func);
 
     public Timing GetTiming(string name) => Timings[name];
 
     public void PrintTimings()
     {
-        foreach (var timing in Timings) Console.WriteLine($"{timing.Key}\t\t|\t{timing.Value}");
+        var keyLen = Timings.Keys.Max(x => x.Length);
+        foreach (var timing in Timings) Console.WriteLine($"{timing.Key.PadRight(keyLen)}\t|\t{timing.Value}");
     }
 }
