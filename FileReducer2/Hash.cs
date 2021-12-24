@@ -1,6 +1,5 @@
-﻿namespace FileReducer;
+﻿namespace FileReducer2;
 
-using LiteDB;
 using System;
 using System.Buffers;
 using System.Collections.Generic;
@@ -29,6 +28,31 @@ public readonly struct Hash : IEquatable<Hash>, IComparable<Hash>
             hasher.Update(buffer.Span[..bytesRead]);
             progress?.Report(bytesRead);
         }
+        if (dispose) await toHash.DisposeAsync();
+        return new(hasher.Finish());
+    }
+    public static async Task<Hash> Blake2b(FileStream toHash, Memory<byte> buffer, long hashLength, bool dispose = true, IProgress<long>? progress = null, CancellationToken cancellationToken = default)
+    {
+        if (hashLength == 0) return await Blake2b(toHash, buffer, dispose, progress, cancellationToken);
+
+        var hasher = Blake2Fast.Blake2b.CreateIncrementalHasher();
+        async Task Read()
+        {
+            long subTotalRead = 0;
+            int bytesRead;
+            while (subTotalRead < hashLength
+                && (bytesRead = await toHash.ReadAsync(buffer.Slice(0, (int)Math.Min(hashLength - subTotalRead, buffer.Length)), cancellationToken)) > 0)
+            {
+                hasher.Update(buffer.Span[..bytesRead]);
+                progress?.Report(bytesRead);
+                subTotalRead += bytesRead;
+            }
+        }
+        await Read();
+        toHash.Seek((toHash.Length / 2) - (hashLength / 2), SeekOrigin.Begin);
+        await Read();
+        toHash.Seek(hashLength, SeekOrigin.End);
+        await Read();
         if (dispose) await toHash.DisposeAsync();
         return new(hasher.Finish());
     }

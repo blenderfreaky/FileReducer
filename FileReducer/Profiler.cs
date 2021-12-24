@@ -12,7 +12,7 @@ public class Profiler
     public static T MeasureStatic<T>(string name, Func<T> action) => Global.Measure(name, action);
     public static T MeasureStaticF<T>(string name, Func<T> action) => MeasureStatic(name, action);
 
-    private ConcurrentDictionary<string, Timing> Timings { get; } = new();
+    private ConcurrentDictionary<string, Timing> TimingsInternal { get; } = new();
 
     public record struct Timing(TimeSpan TotalTime, int CallCount)
     {
@@ -38,7 +38,7 @@ public class Profiler
     private void StopTimer(Timer timer)
     {
         timer.Stopwatch.Stop();
-        Timings.AddOrUpdate(timer.Name, _ => new(timer.Stopwatch.Elapsed, 1), (_, prev) => new(prev.TotalTime + timer.Stopwatch.Elapsed, prev.CallCount + 1));
+        TimingsInternal.AddOrUpdate(timer.Name, _ => new(timer.Stopwatch.Elapsed, 1), (_, prev) => new(prev.TotalTime + timer.Stopwatch.Elapsed, prev.CallCount + 1));
     }
 
     public Timer Measure(string name) => new(Stopwatch.StartNew(), this, name);
@@ -55,7 +55,9 @@ public class Profiler
     }
     public T MeasureF<T>(string name, Func<T> func) => Measure(name, func);
 
-    public Timing GetTiming(string name) => Timings[name];
+    public Timing GetTiming(string name) => TimingsInternal[name];
+
+    public IReadOnlyDictionary<string, Timing> Timings => TimingsInternal;
 
     public void PrintTimings()
     {

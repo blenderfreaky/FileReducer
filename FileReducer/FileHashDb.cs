@@ -42,6 +42,7 @@ public class FileHashDb : IDisposable
     }
 
     private Dictionary<int, Dictionary<string, DataHash>> InMemoryCache { get; } = new();
+    private Dictionary<int, HashSet<string>> NotInFileCache { get; } = new();
 
     private bool MemCache(FileSystemInfo info, int segmentLength, out DataHash hash) =>
         InMemoryCache.GetOrCreate(segmentLength).TryGetValue(info.FullName, out hash) && IsValidCache(hash, info, segmentLength);
@@ -54,12 +55,16 @@ public class FileHashDb : IDisposable
             var isDirectory = info is not FileInfo fileInfo;
 
             if (MemCache(info, segmentLength, out var cached)) return cached;
+
+            if (NotInFileCache.GetOrCreate(segmentLength).Contains(info.FullName)) return null;
+
             if (!isDirectory && restrictFilesToMemoryCache)
             {
                 var directory = Path.GetDirectoryName(info.FullName);
                 PreCache(directory ?? "");
 
                 if (MemCache(info, segmentLength, out cached)) return cached;
+                NotInFileCache.GetOrCreate(segmentLength).Add(info.FullName);
                 return null;
             }
 
@@ -67,8 +72,11 @@ public class FileHashDb : IDisposable
                 .Where(x => x.Path == info.FullName && x.LastWriteUtc >= info.LastWriteTimeUtc)
                 .Where(SegmentLengthCheck(segmentLength))
                 .FirstOrDefault();
-            if (result == default) return null;
-            if (!IsValidCache(result, info, segmentLength)) return null;
+            if (result == default || !IsValidCache(result, info, segmentLength))
+            {
+                NotInFileCache.GetOrCreate(segmentLength).Add(info.FullName);
+                return null;
+            }
 
             AddToMemCache(result);
             if (isDirectory && preCacheDirectories)
@@ -131,7 +139,7 @@ public class FileHashDb : IDisposable
         bool IHasher.ShouldHash(FileSystemInfo info) => ShouldHash(info);
     }
 
-    public async Task<DataHash> HashFileSystemInfo(FileSystemInfo info, int segmentLength = 8192, CancellationToken cancellationToken = default)
+    public async Task<DataHash> HashFileSystemInfo(FileSystemInfo info, int segmentLength = 8192, IProgress<DataHash.ProgressReport>? progress = null, CancellationToken cancellationToken = default)
     {
         Ignore.Ignore ignore = new();
         var path = Path.Combine(info is DirectoryInfo directory ? directory.FullName : Path.GetDirectoryName(info.FullName)!, ".dupeignore");
@@ -144,14 +152,19 @@ public class FileHashDb : IDisposable
             try
             {
                 Hashes.Upsert(hash);
-                if (hash.IsDirectory) Console.WriteLine($"Finished hashing ({time ?? TimeSpan.Zero}) {hash.Path}");
+                //if (hash.IsDirectory) Console.WriteLine($"Finished hashing ({time ?? TimeSpan.Zero}) {hash.Path}");
             }
             catch (LiteException) { }
-        }), cancellationToken);
+        }), progress, cancellationToken);
         return hash;
     }
 
-    public async Task<List<List<DataHash>>> GetDuplicates(string? directory = null, CancellationToken cancellationToken = default)
+    public record struct ProgressReportDuplicates(int Step, int Steps, ProgressReportVerification SubReport)
+    {
+        public double ToPercentage() => 100 * (Step / (double)Steps);
+    }
+
+    public async Task<List<List<DataHash>>> GetDuplicates(string? directory = null, IProgress<ProgressReportDuplicates>? progress = null, CancellationToken cancellationToken = default)
     {
         var allDupes = Profiler.MeasureStaticF("Duplicates.Query", () => GetDuplicateCandidates(directory));
 
@@ -159,18 +172,25 @@ public class FileHashDb : IDisposable
 
         using var _ = Profiler.MeasureStatic("Duplicates.Verification");
         var steps = new int[] { 2, 4, 8, 16, 32, 64, 0 };
+        int i = 0;
         foreach (var step in steps)
         {
             if (cancellationToken.IsCancellationRequested) return null!;
-            Console.WriteLine("Starting dedupe step " + step);
-            Profiler.Global.PrintTimings();
+
+            var subProgress = new Progress<ProgressReportVerification>(x => progress?.Report(new (i, steps.Length, x)));
+
+            //Console.WriteLine("Starting dedupe step " + step);
+            //Profiler.Global.PrintTimings();
             using var __ = Profiler.MeasureStatic("Duplicates.Verification." + step);
-            allDupes = (await VerifyDuplicates(allDupes, step * 8192, cancellationToken)).Select(x => x.ToList()).ToList();
+            allDupes = (await VerifyDuplicates(allDupes, step * 8192, subProgress, cancellationToken)).Select(x => x.ToList()).ToList();
 
             var falsePositives = allDupes.Sum(x => x.Count) - previousDupeCount;
-            if (falsePositives > 0) Console.WriteLine("Removed " + falsePositives + " false positives in step " + step);
-            else Console.WriteLine("No false positives in step " + step);
+            //if (falsePositives > 0) Console.WriteLine("Removed " + falsePositives + " false positives in step " + step);
+            //else Console.WriteLine("No false positives in step " + step);
+            i++;
         }
+
+        progress?.Report(new(steps.Length, steps.Length, default));
 
         return allDupes;
     }
@@ -196,15 +216,36 @@ public class FileHashDb : IDisposable
         : x => x.SegmentLength == segmentLength
         || (x.DataLength <= segmentLength * 2 && (x.SegmentLength == 0 || x.DataLength <= x.SegmentLength * 2));
 
-    private async Task<IEnumerable<IEnumerable<DataHash>>> VerifyDuplicates(IEnumerable<IEnumerable<DataHash>> duplicateGroups, int segmentLength = 0, CancellationToken cancellationToken = default)
+    public record struct ProgressReportVerification(long BytesRead, long BytesToRead, DataHash.ProgressReport SubReport)
     {
+        public double ToPercentage() => 100 * (BytesRead / (double)BytesToRead);
+    }
+
+    // TODO: IMPORTANT: Exclude files in duplicate candidate folders until the folders get verified to either
+    //                      be duplicates of each other  => only check for one and return for both
+    //                      be different from each other => check both individually
+    private async Task<IEnumerable<IEnumerable<DataHash>>> VerifyDuplicates(IEnumerable<IEnumerable<DataHash>> duplicateGroups, int segmentLength = 0, IProgress<ProgressReportVerification>? progress = null, CancellationToken cancellationToken = default)
+    {
+        long totalToRead = 0;
+        long totalRead = 0;
+        var subProgress = progress == null ? null : new Progress<DataHash.ProgressReport>(x => {
+            var prevBytesToRead = totalToRead;
+            var toReadDiff = x.BytesToRead - x.PrevBytesToRead;
+            if (toReadDiff != 0 && x.BytesToRead != long.MaxValue)
+            {
+                Interlocked.Add(ref totalToRead, x.PrevBytesToRead == long.MaxValue ? x.BytesToRead : toReadDiff);
+            }
+            if (x.BytesRead != 0) Interlocked.Add(ref totalRead, x.BytesRead);
+            progress.Report(new(totalRead, totalToRead, x));
+        });
+
         var result = duplicateGroups.Select(async duplicates =>
         {
             var hashTasks = duplicates.Select(async x =>
                 {
                     var info = DataHash.FolderOrFile(x.Path);
                     if (info == null) return default;
-                    return await HashFileSystemInfo(info, segmentLength, cancellationToken);
+                    return await HashFileSystemInfo(info, segmentLength, subProgress, cancellationToken);
                 })
                 .Where(x => x != default).ToList();
 

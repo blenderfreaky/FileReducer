@@ -1,27 +1,56 @@
 ﻿using FileReducer;
+using FileReducer.SpectreConsole;
+using FileReducer2;
+using Spectre.Console;
 
-//var folder = @"C:\Users\blend\Downloads";
-var folder = @"E:\Stuff";
+var folder = @"C:\Users\blend\Downloads";
+//var folder = @"E:\Stuff";
 
 using (Profiler.MeasureStatic("Total"))
 {
-    FileHashDb db = new(32);
+    //FileHashDb db = new(32);
 
-    //var hash1 = await db.HashFileSystemInfo(new FileInfo(folder + "\\LiteDB.Studio.exe"));
-    //var hash2 = await db.HashFileSystemInfo(new FileInfo(folder + "\\LiteDB.Studio(1).exe"));
+    //await AnsiConsole.Progress()
+    //    .StartAsync(async ctx =>
+    //    {
+    //        // Define tasks
+    //        var hashing = ctx.AddTask("[green]Hashing files[/]");
 
-    //var hasher = new TrivialHasher(5);
-    //var hash1 = await DataHash.FromFileAsync(new(folder + "\\LiteDB.Studio.exe"), hasher);
-    //var hash2 = await DataHash.FromFileAsync(new(folder + "\\LiteDB.Studio(1).exe"), hasher);
+    //        await db.HashFileSystemInfo(new DirectoryInfo(folder), progress: new Progress<DataHash.ProgressReport>(x => hashing.Value = x.ToPercentage()));
+    //    });
 
-    await db.HashFileSystemInfo(new DirectoryInfo(folder));
+    //List<List<DataHash>>? dupes = null;
 
-    Console.WriteLine("\nDone Hashing\n");
+    //await AnsiConsole.Progress()
+    //    .StartAsync(async ctx =>
+    //    {
+    //        // Define tasks
+    //        var hashing1 = ctx.AddTask("[green]Checking duplicates[/]");
+    //        var hashing2 = ctx.AddTask("[green]Hashing bigger segments for all duplicates[/]");
+    //        var hashing3 = ctx.AddTask("[green]Current hashing[/]");
 
-    foreach(var duplicates in await db.GetDuplicates(folder))
-    {
-        Console.WriteLine("Duplicates: " + StringUtils.ShortJoin(", ", duplicates.ConvertAll(x => x.Path), 200));
-    }
+    //        dupes = await db.GetDuplicates(folder, new Progress<FileHashDb.ProgressReportDuplicates>(x => {
+    //            hashing1.Value = x.ToPercentage();
+    //            hashing2.Value = x.SubReport.ToPercentage();
+    //            hashing3.Value = x.SubReport.ToPercentage();
+    //        }));
+    //    });
+
+    //dupes!.PrintAsTree();
+
+    //await File.WriteAllLinesAsync("dupes.csv", dupes!.Select(x => string.Join(',', x)));
+
+    await AnsiConsole.Progress()
+        .StartAsync(async ctx =>
+        {
+            // Define tasks
+            var hashing = ctx.AddTask("[green]Hashing files[/]");
+
+            Hasher hasher = new(1024, 4096, new(128, 128), new Progress<(long TotalRead, long ToRead)>(x => hashing.Value = 
+            (double)x.TotalRead / (double)x.ToRead * 100d), default);
+
+            await hasher.Hash(new DirectoryInfo(folder));
+        });
 }
 
-Profiler.Global.PrintTimings();
+Profiler.Global.PrintTimingsSpectre();
